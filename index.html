@@ -265,6 +265,9 @@ label { font-family: inherit; }
 .modal-completed-field .modal-completed-label { display: flex; align-items: center; gap: 0.5rem; font-size: 0.95rem; font-weight: 600; color: var(--ink); cursor: pointer; text-transform: none; letter-spacing: normal; margin-bottom: 0; }
 .modal-completed-label input[type="checkbox"] { width: 18px; height: 18px; accent-color: #AACF38; }
  
+.modal-duplicate-btn { width: 100%; background: transparent; border: 1px solid var(--line); color: var(--ink); margin-top: 0.8rem; }
+.modal-duplicate-btn:hover { background: var(--paper); }
+.modal-duplicate-btn[hidden] { display: none; }
 .modal-delete-btn { width: 100%; background: transparent; border: 1px solid var(--line); color: var(--danger); margin-top: 0.4rem; }
 .modal-delete-btn:hover { background: var(--danger); color: #fff; border-color: var(--danger); }
  
@@ -541,6 +544,7 @@ label { font-family: inherit; }
       </label>
     </div>
  
+    <button id="modal-duplicate-btn" class="modal-duplicate-btn">Duplica scheda</button>
     <button id="modal-delete-btn" class="modal-delete-btn">Elimina scheda</button>
   </div>
  
@@ -630,6 +634,7 @@ const newSubtaskInput = document.getElementById("new-subtask-input");
 const addSubtaskBtn = document.getElementById("add-subtask-btn");
 const modalCompleted = document.getElementById("modal-completed");
 const modalDeleteBtn = document.getElementById("modal-delete-btn");
+const modalDuplicateBtn = document.getElementById("modal-duplicate-btn");
  
 let boards = [];
 let categories = [];
@@ -1823,6 +1828,7 @@ function openTaskModal(taskId) {
   const isShared = !!(activeBoard() && activeBoard().virtual);
   modalCategory.disabled = isShared;
   modalDeleteBtn.hidden = isShared;
+  modalDuplicateBtn.hidden = isShared;
   renderModalMembers(task);
   renderModalSubtasks(task);
   modalCompleted.checked = (task.status || "todo") === "done";
@@ -1859,6 +1865,23 @@ modalDeadline.addEventListener("change", () => {
 modalDesc.addEventListener("change", () => {
   const task = activeTask(); if (!task) return;
   task.desc = modalDesc.value; scheduleSave();
+});
+modalDuplicateBtn.addEventListener("click", () => {
+  const board = activeBoard(); const task = activeTask();
+  if (!board || !task || board.virtual) return;
+  const copy = JSON.parse(JSON.stringify(task));
+  copy.id = uid_();
+  copy.title = (task.title || "Senza titolo") + " (copia)";
+  copy.status = "todo";
+  copy.deadline = null;
+  copy.subtasks = (copy.subtasks || []).map((st) => ({ id: uid_(), text: st.text, done: false }));
+  copy.order = Date.now();
+  copy.createdAt = Date.now();
+  board.data.tasks.push(copy);
+  scheduleSave();
+  if (view === "board") renderBoardView();
+  openTaskModal(copy.id);
+  modalTitle.focus(); modalTitle.select();
 });
 modalDeleteBtn.addEventListener("click", () => {
   const board = activeBoard(); const task = activeTask();
