@@ -304,7 +304,11 @@ label { font-family: inherit; }
 .side-panel { position: fixed; top: 0; right: 0; height: 100%; width: 300px; max-width: 90vw; background: var(--card-bg); border-left: 1px solid var(--line); z-index: 11; padding: 1.25rem; display: flex; flex-direction: column; gap: 1rem; overflow-y: auto; }
 .side-panel h2 { font-size: 1.05rem; }
 .panel-close { position: absolute; top: 1rem; right: 1rem; background: transparent; color: var(--ink-soft); font-size: 1.2rem; }
-.item-row { display: flex; align-items: center; gap: 0.5rem; }
+.item-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.item-email-input { flex: 1 1 100%; order: 5; border: 1px dashed var(--line); border-radius: 5px; padding: 0.3rem 0.5rem; font-size: 0.8rem; background: var(--paper); color: var(--ink); }
+.item-email-input.linked { border: 1px solid var(--teal, #2f6f6b); }
+.card-from { font-size: 0.72rem; opacity: 0.7; margin-top: 0.25rem; }
+.shared-from { font-size: 0.85rem; opacity: 0.8; }
 .item-color-input { width: 32px; height: 28px; padding: 0; border: 1px solid var(--line); border-radius: 5px; background: none; }
 .item-name-input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 5px; padding: 0.35rem 0.5rem; font-size: 0.9rem; background: var(--paper); color: var(--ink); }
 .item-delete { background: transparent; color: var(--ink-soft); font-size: 0.95rem; padding: 0 0.3rem; }
@@ -589,7 +593,16 @@ let suppressCardClick = false;
 let digest = null; // { digest_time, selection_date, recall_done_date, task_refs }
 let digestInterval = null;
  
-function activeBoard() { return boards.find((b) => b.id === activeBoardId); }
+let myUserId = null, myEmail = "";
+let sharedRows = [];          // righe di shared_tasks visibili a me (inviate e ricevute)
+let sharedBoard = null;       // bacheca virtuale "Assegnati a me"
+const sharedCache = {};       // ultimo contenuto sincronizzato: taskId|assigneeId -> json
+const sharedNameCache = {};   // ultimo nome bacheca inviato
+const SHARED_ID = "__shared__";
+function activeBoard() {
+  if (activeBoardId === SHARED_ID) return sharedBoard;
+  return boards.find((b) => b.id === activeBoardId);
+}
 function activeTask() {
   const board = activeBoard();
   if (!board) return null;
@@ -693,6 +706,7 @@ document.addEventListener("click", (e) => {
 /* ---------- AUTH ---------- */
 if (sb) sb.auth.onAuthStateChange((_event, session) => {
   if (session && session.user) {
+    myUserId = session.user.id; myEmail = session.user.email || "";
     loginScreen.hidden = true;
     appEl.hidden = false;
     loadEverything();
@@ -752,6 +766,7 @@ async function loadEverything() {
   }
  
   digestTimeInput.value = digest.digest_time || "14:30";
+  await loadShared();
   await digestTick();
  
   goHome();
@@ -793,6 +808,7 @@ function subscribeRealtime() {
       if (view === "board") renderBoardView();
       renderSidePanel();
     })
+    .on("postgres_changes", { event: "*", schema: "public", table: "shared_tasks" }, onSharedChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "people" }, (payload) => {
       applyItemChange(people, payload);
       if (view === "board") renderBoardView();
@@ -820,11 +836,142 @@ async function saveNow() {
   clearTimeout(saveTimeout);
   const board = activeBoard();
   if (!board) { dirty = false; return; }
+  if (board.virtual) { await saveSharedEdits(); dirty = false; return; }
   const { error } = await sb.from("boards")
     .update({ name: board.name, data: board.data, updated_at: new Date().toISOString() })
     .eq("id", board.id);
   dirty = false;
   if (error) console.error("Errore nel salvataggio:", error.message);
+  else syncSharedTasks([board]);
+}
+ 
+/* ---------- CONDIVISIONE TASK TRA COLLEGHI ---------- */
+function pickShared(t) {
+  return {
+    title: t.title || "", desc: t.desc || "", status: t.status || "todo",
+    urgency: t.urgency || "media", subtasks: t.subtasks || [],
+    deadline: t.deadline || null, createdAt: t.createdAt || 0, order: t.order || 0,
+  };
+}
+function myName() { return (myEmail || "collega").split("@")[0]; }
+function upsertLocalRow(row) {
+  const i = sharedRows.findIndex((r) => r.id === row.id);
+  if (i === -1) sharedRows.push(row); else sharedRows[i] = row;
+}
+function linkedAssignees(task) {
+  const ids = [];
+  (task.memberIds || []).forEach((pid) => {
+    const p = people.find((x) => x.id === pid);
+    if (p && p.linked_user_id && p.linked_user_id !== myUserId && !ids.includes(p.linked_user_id)) ids.push(p.linked_user_id);
+  });
+  return ids;
+}
+async function loadShared() {
+  const { data, error } = await sb.from("shared_tasks").select("*");
+  if (error) {
+    console.error("shared_tasks:", error.message);
+    sharedRows = [];
+    return;
+  }
+  sharedRows = data || [];
+  let changed = false;
+  for (const r of sharedRows) {
+    if (r.owner_id === myUserId && (await applySharedRowToOwner(r))) changed = true;
+  }
+  await syncSharedTasks(boards);
+}
+// Le modifiche fatte dal collega su un mio task tornano nella mia bacheca.
+async function applySharedRowToOwner(row) {
+  const key = row.task_id + "|" + row.assignee_id;
+  const s = JSON.stringify(row.data);
+  if (sharedCache[key] === s) return false;
+  sharedCache[key] = s;
+  const found = findTaskAnyBoard(row.task_id);
+  if (!found) return false;
+  if (JSON.stringify(pickShared(found.task)) === s) return false;
+  Object.assign(found.task, row.data);
+  if (found.task.status === "done") removeFromDigestIfPresent(found.task.id);
+  await sb.from("boards").update({ data: found.board.data, updated_at: new Date().toISOString() }).eq("id", found.board.id);
+  return true;
+}
+async function syncSharedTasks(boardList) {
+  if (!myUserId) return;
+  try {
+    for (const b of boardList) {
+      for (const t of (b.data.tasks || [])) {
+        const desired = linkedAssignees(t);
+        const payload = pickShared(t);
+        const sd = JSON.stringify(payload);
+        for (const aid of desired) {
+          const key = t.id + "|" + aid;
+          if (sharedCache[key] === sd && sharedNameCache[key] === b.name) continue;
+          sharedCache[key] = sd; sharedNameCache[key] = b.name;
+          const { data, error } = await sb.from("shared_tasks").upsert(
+            { task_id: t.id, assignee_id: aid, owner_name: myName(), board_name: b.name || "", data: payload, updated_at: new Date().toISOString() },
+            { onConflict: "task_id,assignee_id" }
+          ).select().single();
+          if (error) { delete sharedCache[key]; console.error("Condivisione task:", error.message); continue; }
+          upsertLocalRow(data);
+        }
+        const stale = sharedRows.filter((r) => r.owner_id === myUserId && r.task_id === t.id && !desired.includes(r.assignee_id));
+        for (const r of stale) {
+          await sb.from("shared_tasks").delete().eq("id", r.id);
+          sharedRows = sharedRows.filter((x) => x.id !== r.id);
+        }
+      }
+    }
+    // task eliminati: togli le copie condivise
+    const allIds = new Set();
+    boards.forEach((b) => (b.data.tasks || []).forEach((t) => allIds.add(t.id)));
+    const orphans = sharedRows.filter((r) => r.owner_id === myUserId && !allIds.has(r.task_id));
+    for (const r of orphans) {
+      await sb.from("shared_tasks").delete().eq("id", r.id);
+      sharedRows = sharedRows.filter((x) => x.id !== r.id);
+    }
+  } catch (e) { console.error("Errore sync condivisione:", e); }
+}
+function incomingRows() { return sharedRows.filter((r) => r.assignee_id === myUserId); }
+function rebuildSharedBoard() {
+  sharedBoard = {
+    id: SHARED_ID, name: "Assegnati a me", virtual: true,
+    data: { tasks: incomingRows().map((r) => Object.assign({
+      id: r.task_id, _row: r.id, _owner: r.owner_name, _boardName: r.board_name,
+      categoryId: null, memberIds: [],
+    }, r.data)) },
+  };
+}
+async function saveSharedEdits() {
+  if (!sharedBoard) return;
+  for (const t of sharedBoard.data.tasks) {
+    const row = sharedRows.find((r) => r.id === t._row);
+    if (!row) continue;
+    const payload = pickShared(t);
+    if (JSON.stringify(row.data) === JSON.stringify(payload)) continue;
+    row.data = payload;
+    const { error } = await sb.from("shared_tasks").update({ data: payload, updated_at: new Date().toISOString() }).eq("id", row.id);
+    if (error) console.error("Salvataggio task assegnato:", error.message);
+  }
+}
+async function onSharedChange(payload) {
+  if (payload.eventType === "DELETE") {
+    sharedRows = sharedRows.filter((r) => r.id !== payload.old.id);
+  } else {
+    const row = payload.new;
+    upsertLocalRow(row);
+    if (row.owner_id === myUserId) {
+      const changed = await applySharedRowToOwner(row);
+      if (changed) {
+        if (view === "board" && activeBoardId && activeBoardId !== SHARED_ID && taskModal.hidden) renderBoardView();
+        if (view === "home") { renderHome(); renderMyTasksPanel(); }
+      }
+    }
+  }
+  if (view === "board" && activeBoardId === SHARED_ID) {
+    if (!dirty && taskModal.hidden) {
+      rebuildSharedBoard();
+      if (incomingRows().length === 0) goHome(); else renderBoardView();
+    }
+  } else if (view === "home") renderHome();
 }
  
 /* ---------- DAILY DIGEST: "le mie attivita'" ---------- */
@@ -1082,8 +1229,19 @@ function buildFolderTile(b) {
   return tile;
 }
  
+function buildSharedTile() {
+  const rows = incomingRows();
+  const open = rows.filter((r) => (r.data.status || "todo") !== "done").length;
+  const tile = document.createElement("button");
+  tile.className = "folder-tile";
+  tile.innerHTML = '<span class="folder-icon"></span><span class="folder-label"></span>';
+  tile.querySelector(".folder-label").textContent = "Assegnati a me (" + open + ")";
+  tile.addEventListener("click", () => { closeArchivePanel(); rebuildSharedBoard(); openBoard(SHARED_ID); });
+  return tile;
+}
 function renderHome() {
   folderGrid.innerHTML = "";
+  if (incomingRows().length > 0) folderGrid.appendChild(buildSharedTile());
   boards.slice().sort((a, b) => a.position - b.position)
     .filter((b) => !isBoardArchived(b))
     .forEach((b) => folderGrid.appendChild(buildFolderTile(b)));
@@ -1170,6 +1328,9 @@ function renderBoardView() {
   contextTitle.textContent = board.name || "Bacheca";
   boardNameInput.value = board.name || "";
   boardDeadlineInput.value = board.data.deadline || "";
+  boardNameInput.disabled = !!board.virtual;
+  boardDeadlineInput.disabled = !!board.virtual;
+  deleteBoardBtn.hidden = !!board.virtual;
   boardColumnsEl.innerHTML = "";
   if (!board.data.tasks) board.data.tasks = [];
   COLUMNS.forEach((col) => boardColumnsEl.appendChild(renderColumn(board, col)));
@@ -1180,6 +1341,7 @@ function renderColumn(board, col) {
   node.className = "column";
   node.innerHTML = '<div class="column-header"><h2></h2><button class="add-card-btn" title="Aggiungi scheda">+</button></div><div class="card-list"></div>';
   node.querySelector("h2").textContent = col.title;
+  if (board.virtual) node.querySelector(".add-card-btn").hidden = true;
  
   node.querySelector(".add-card-btn").addEventListener("click", () => {
     const task = {
@@ -1266,6 +1428,12 @@ function renderCard(board, task) {
   });
   metaRow.appendChild(avatarRow);
   node.appendChild(metaRow);
+  if (task._owner) {
+    const from = document.createElement("div");
+    from.className = "card-from";
+    from.textContent = "da " + task._owner + (task._boardName ? " · " + task._boardName : "");
+    node.appendChild(from);
+  }
  
   if (task.deadline) {
     const status = deadlineStatus(task.deadline);
@@ -1301,6 +1469,9 @@ function openTaskModal(taskId) {
   modalDeadline.value = task.deadline || "";
   modalDesc.value = task.desc || "";
  
+  const isShared = !!(activeBoard() && activeBoard().virtual);
+  modalCategory.disabled = isShared;
+  modalDeleteBtn.hidden = isShared;
   renderModalMembers(task);
   renderModalSubtasks(task);
   modalCompleted.checked = (task.status || "todo") === "done";
@@ -1359,6 +1530,13 @@ modalCompleted.addEventListener("change", () => {
  
 function renderModalMembers(task) {
   modalMembers.innerHTML = "";
+  if (task._owner) {
+    const tag = document.createElement("span");
+    tag.className = "shared-from";
+    tag.textContent = "Assegnato da " + task._owner + (task._boardName ? " · " + task._boardName : "");
+    modalMembers.appendChild(tag);
+    return;
+  }
   (task.memberIds || []).forEach((pid) => {
     const person = people.find((p) => p.id === pid);
     if (!person) return;
@@ -1484,7 +1662,7 @@ function renderSidePanel() {
   list.slice().sort((a, b) => a.position - b.position).forEach((item) => {
     const row = document.createElement("div");
     row.className = "item-row";
-    row.innerHTML = '<input type="color" class="item-color-input" /><input type="text" class="item-name-input" /><button class="item-delete" title="Elimina">&times;</button>';
+    row.innerHTML = '<input type="color" class="item-color-input" /><input type="text" class="item-name-input" /><button class="item-delete" title="Elimina">&times;</button>' + (panelKind === "people" ? '<input type="email" class="item-email-input" placeholder="Email del collega (per condividere i task)" />' : "");
     const colorInput = row.querySelector(".item-color-input");
     const nameInput = row.querySelector(".item-name-input");
     colorInput.value = item.color;
@@ -1494,6 +1672,27 @@ function renderSidePanel() {
       if (error) { alert("Errore nel salvataggio: " + error.message); return; }
       item.name = nameInput.value; item.color = colorInput.value;
       if (view === "board") renderBoardView();
+    }
+    const emailInput = row.querySelector(".item-email-input");
+    if (emailInput) {
+      emailInput.value = item.linked_email || "";
+      emailInput.classList.toggle("linked", !!item.linked_user_id);
+      emailInput.addEventListener("change", async () => {
+        const email = emailInput.value.trim();
+        let uid = null;
+        if (email) {
+          const { data, error } = await sb.rpc("lookup_user_by_email", { p_email: email });
+          if (error) { alert("Errore nella ricerca dell'utente: " + error.message + "\n(Hai eseguito lo schema SQL aggiornato?)"); emailInput.value = item.linked_email || ""; return; }
+          if (!data) { alert("Nessun utente workFlow con questa email. Deve prima avere un account."); emailInput.value = item.linked_email || ""; return; }
+          if (data === myUserId) { alert("Questa è la tua email."); emailInput.value = item.linked_email || ""; return; }
+          uid = data;
+        }
+        const { error: upErr } = await sb.from("people").update({ linked_email: email || null, linked_user_id: uid }).eq("id", item.id);
+        if (upErr) { alert("Errore nel salvataggio: " + upErr.message); return; }
+        item.linked_email = email || null; item.linked_user_id = uid;
+        emailInput.classList.toggle("linked", !!uid);
+        await syncSharedTasks(boards);
+      });
     }
     colorInput.addEventListener("change", saveItem);
     nameInput.addEventListener("change", saveItem);
