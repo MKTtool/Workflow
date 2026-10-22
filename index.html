@@ -303,6 +303,23 @@ label { font-family: inherit; }
 .notif-empty { padding: 0.9rem 0.7rem; font-size: 0.85rem; opacity: 0.7; }
 .notif-foot { padding: 0.4rem 0.7rem; font-size: 0.72rem; opacity: 0.55; text-align: center; }
  
+.share-dialog {
+  position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 22; width: 420px; max-width: 92vw;
+  background: var(--card-bg, #fff); color: var(--ink); border-radius: 10px; padding: 1rem 1.1rem; box-shadow: 0 12px 32px rgba(0,0,0,0.25);
+}
+.share-dialog[hidden], #share-backdrop[hidden] { display: none; }
+#share-backdrop { z-index: 21; }
+.share-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.6rem; font-size: 1.05rem; }
+.share-list { display: flex; flex-direction: column; gap: 0.35rem; margin-bottom: 0.7rem; }
+.share-row { display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 0.35rem 0.6rem; font-size: 0.9rem; }
+.share-row button { background: transparent; border: 0; color: var(--ink-soft); cursor: pointer; font-size: 1.1rem; }
+.share-empty { font-size: 0.85rem; opacity: 0.7; }
+.share-add { display: flex; gap: 0.4rem; }
+.share-add input { flex: 1; min-width: 0; border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.9rem; background: var(--paper); color: var(--ink); }
+.share-add button { background: var(--teal, #2f6f6b); color: #fff; border: 0; border-radius: 6px; padding: 0.4rem 0.9rem; cursor: pointer; }
+.share-hint { font-size: 0.75rem; opacity: 0.65; margin: 0.6rem 0 0; }
+.folder-shared-tag { display: block; font-size: 0.7rem; opacity: 0.7; }
+ 
 /* ---------- MENU IMPOSTAZIONI ---------- */
 .settings-menu {
   position: absolute; top: calc(100% + 6px); right: 0; background: var(--card-bg);
@@ -430,6 +447,7 @@ label { font-family: inherit; }
         <label class="board-deadline-label">Scadenza
           <input id="board-deadline-input" type="date" />
         </label>
+        <button id="share-board-btn" class="btn-ghost">Condividi</button>
         <button id="delete-board-btn" class="btn-ghost">Elimina bacheca</button>
       </div>
       <div id="board-columns" class="board-columns"></div>
@@ -459,6 +477,16 @@ label { font-family: inherit; }
   </aside>
  
   <!-- MODALE: dettaglio scheda -->
+  <div id="share-backdrop" class="modal-backdrop" hidden></div>
+  <div id="share-dialog" class="share-dialog" hidden>
+    <div class="share-head"><strong id="share-title">Condividi bacheca</strong><button id="share-close" class="btn-ghost">&times;</button></div>
+    <div id="share-list" class="share-list"></div>
+    <div class="share-add">
+      <input id="share-email" type="email" placeholder="Email del collega" />
+      <button id="share-add-btn">Invita</button>
+    </div>
+    <p class="share-hint">Chi inviti vede e modifica tutti i task di questa bacheca, in tempo reale. Solo tu puoi rinominarla, condividerla o eliminarla.</p>
+  </div>
   <div id="modal-backdrop" class="modal-backdrop" hidden></div>
   <div id="task-modal" class="task-modal" hidden>
     <button id="modal-close" class="modal-close">&times;</button>
@@ -766,6 +794,10 @@ async function loadEverything() {
   if (digestErr) { alert("Errore nel caricamento delle impostazioni del digest: " + digestErr.message); return; }
  
   boards = boardData;
+  const memRes = await sb.from("board_members").select("*");
+  boardMembers = memRes.error ? [] : (memRes.data || []);
+  if (memRes.error) console.error("board_members:", memRes.error.message);
+  boards.forEach(setBase);
   categories = catData;
   people = peopleData;
  
@@ -823,6 +855,7 @@ function subscribeRealtime() {
       else {
         const idx = boards.findIndex((b) => b.id === payload.new.id);
         if (idx === -1) boards.push(payload.new); else boards[idx] = payload.new;
+        setBase(payload.new);
       }
       if (view === "home") renderHome();
       else if (activeBoard()) renderBoardView(); else goHome();
@@ -834,6 +867,7 @@ function subscribeRealtime() {
       renderSidePanel();
     })
     .on("postgres_changes", { event: "*", schema: "public", table: "shared_tasks" }, onSharedChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "board_members" }, onMembersChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "notifications", filter: "user_id=eq." + myUserId }, onNotificationChange)
     .on("postgres_changes", { event: "*", schema: "public", table: "people" }, (payload) => {
       applyItemChange(people, payload);
@@ -863,13 +897,197 @@ async function saveNow() {
   const board = activeBoard();
   if (!board) { dirty = false; return; }
   if (board.virtual) { await saveSharedEdits(); dirty = false; return; }
+  if (isBoardShared(board)) {
+    const before = JSON.stringify(board.data);
+    const ok = await saveBoardMerged(board);
+    dirty = false;
+    if (ok) {
+      syncSharedTasks([board]);
+      if (JSON.stringify(board.data) !== before && view === "board" && activeBoardId === board.id && taskModal.hidden) renderBoardView();
+    }
+    return;
+  }
   const { error } = await sb.from("boards")
     .update({ name: board.name, data: board.data, updated_at: new Date().toISOString() })
     .eq("id", board.id);
   dirty = false;
   if (error) console.error("Errore nel salvataggio:", error.message);
-  else syncSharedTasks([board]);
+  else { setBase(board); syncSharedTasks([board]); }
 }
+ 
+/* ---------- BACHECHE CONDIVISE ---------- */
+let boardMembers = [];        // righe di board_members visibili a me
+const boardBase = {};         // ultimo stato sincronizzato dei task: boardId -> { taskId: json }
+const shareDialog = document.getElementById("share-dialog");
+const shareBackdrop = document.getElementById("share-backdrop");
+const shareList = document.getElementById("share-list");
+const shareEmail = document.getElementById("share-email");
+const shareTitle = document.getElementById("share-title");
+const shareBoardBtn = document.getElementById("share-board-btn");
+ 
+function isOwner(b) { return b.user_id === myUserId; }
+function isBoardShared(b) { return !!b.user_id && (!isOwner(b) || boardMembers.some((m) => m.board_id === b.id)); }
+function isParticipant(b, uid) { return b.user_id === uid || boardMembers.some((m) => m.board_id === b.id && m.user_id === uid); }
+function catsFor(b) { return (b && b.user_id && !isOwner(b) && b.data.sharedCats) ? b.data.sharedCats : categories; }
+function peopleFor(b) { return (b && b.user_id && !isOwner(b) && b.data.sharedPeople) ? b.data.sharedPeople : people; }
+function taskSnap(b) { const m = {}; (b.data.tasks || []).forEach((t) => { m[t.id] = JSON.stringify(t); }); return m; }
+function setBase(b) { boardBase[b.id] = taskSnap(b); }
+ 
+// Salva una bacheca condivisa unendo le mie modifiche a quelle degli altri (per singolo task).
+async function saveBoardMerged(board) {
+  const owner = isOwner(board);
+  const base = boardBase[board.id] || {};
+  const local = taskSnap(board);
+  const changed = (board.data.tasks || []).filter((t) => local[t.id] !== base[t.id]);
+  const deletedIds = Object.keys(base).filter((id) => !(id in local));
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const { data: remote, error } = await sb.from("boards").select("name,data,updated_at").eq("id", board.id).single();
+    if (error) { console.error("Lettura bacheca condivisa:", error.message); return false; }
+    const rd = remote.data || { tasks: [] };
+    let tasks = (rd.tasks || []).slice();
+    changed.forEach((t) => {
+      const i = tasks.findIndex((x) => x.id === t.id);
+      if (i === -1) tasks.push(t); else tasks[i] = t;
+    });
+    tasks = tasks.filter((t) => !deletedIds.includes(t.id));
+    const merged = Object.assign({}, rd, { tasks });
+    if (owner) {
+      merged.deadline = board.data.deadline || null;
+      merged.sharedCats = categories.map((c) => ({ id: c.id, name: c.name, color: c.color }));
+      merged.sharedPeople = people.map((x) => ({ id: x.id, name: x.name, color: x.color, linked_user_id: x.linked_user_id || null }));
+    }
+    const upd = { data: merged, updated_at: new Date().toISOString() };
+    if (owner) upd.name = board.name;
+    const { data: rows, error: e2 } = await sb.from("boards").update(upd).eq("id", board.id).eq("updated_at", remote.updated_at).select("id");
+    if (e2) { console.error("Salvataggio bacheca condivisa:", e2.message); return false; }
+    if (rows && rows.length) {
+      board.data = merged; board.updated_at = upd.updated_at;
+      notifyNewAssignees(board, changed, base);
+      setBase(board);
+      return true;
+    }
+  }
+  console.error("Bacheca condivisa: troppi conflitti, riprovo al prossimo salvataggio");
+  return false;
+}
+function notifyNewAssignees(board, changed, base) {
+  const ppl = peopleFor(board);
+  changed.forEach((t) => {
+    const prev = base[t.id] ? (JSON.parse(base[t.id]).memberIds || []) : [];
+    (t.memberIds || []).filter((id) => !prev.includes(id)).forEach((pid) => {
+      const person = ppl.find((x) => x.id === pid);
+      if (person && person.linked_user_id && isParticipant(board, person.linked_user_id)) {
+        pushNotification(person.linked_user_id, myName() + " ti ha assegnato «" + (t.title || "Senza titolo") + "»", t.id, "assigned");
+      }
+    });
+  });
+}
+async function persistBoardData(b) {
+  if (isBoardShared(b)) return saveBoardMerged(b);
+  const r = await sb.from("boards").update({ data: b.data, updated_at: new Date().toISOString() }).eq("id", b.id);
+  setBase(b);
+  return r;
+}
+async function refreshShares() {
+  if (!myUserId || dirty) return;
+  const [bRes, mRes] = await Promise.all([sb.from("boards").select("*").order("position", { ascending: true }), sb.from("board_members").select("*")]);
+  if (bRes.error || !bRes.data) return;
+  if (!mRes.error) boardMembers = mRes.data || [];
+  boards = bRes.data;
+  boards.forEach(setBase);
+  if (view === "home") renderHome();
+  else if (view === "board" && activeBoardId !== SHARED_ID) {
+    if (!activeBoard()) goHome();
+    else if (taskModal.hidden) renderBoardView();
+  }
+}
+async function leaveOrDeleteBoard(b) {
+  if (isOwner(b)) {
+    if (boards.filter(isOwner).length === 1) { alert("Non puoi eliminare l'unica bacheca rimasta."); return false; }
+    if (!confirm('Eliminare la bacheca "' + (b.name || "") + '" e tutti i suoi lavori?' + (isBoardShared(b) ? " Sparirà anche ai colleghi con cui è condivisa." : ""))) return false;
+    const { error } = await sb.from("boards").delete().eq("id", b.id);
+    if (error) { alert("Errore nell'eliminazione: " + error.message); return false; }
+  } else {
+    if (!confirm('Uscire dalla bacheca "' + (b.name || "") + '"? Non la vedrai più, ma resta al suo proprietario.')) return false;
+    const { error } = await sb.from("board_members").delete().eq("board_id", b.id).eq("user_id", myUserId);
+    if (error) { alert("Errore: " + error.message); return false; }
+  }
+  boards = boards.filter((x) => x.id !== b.id);
+  boardMembers = boardMembers.filter((m) => m.board_id !== b.id);
+  return true;
+}
+function renderShareDialog() {
+  const b = activeBoard();
+  if (!b) return;
+  shareTitle.textContent = 'Condividi "' + (b.name || "bacheca") + '"';
+  shareList.innerHTML = "";
+  const mine = boardMembers.filter((m) => m.board_id === b.id);
+  if (mine.length === 0) {
+    const e = document.createElement("div"); e.className = "share-empty"; e.textContent = "Non è condivisa con nessuno.";
+    shareList.appendChild(e);
+  }
+  mine.forEach((m) => {
+    const row = document.createElement("div"); row.className = "share-row";
+    const label = document.createElement("span"); label.textContent = m.email || m.user_id;
+    const x = document.createElement("button"); x.innerHTML = "&times;"; x.title = "Rimuovi accesso";
+    x.addEventListener("click", async () => {
+      const { error } = await sb.from("board_members").delete().eq("board_id", b.id).eq("user_id", m.user_id);
+      if (error) { alert("Errore: " + error.message); return; }
+      boardMembers = boardMembers.filter((z) => !(z.board_id === b.id && z.user_id === m.user_id));
+      renderShareDialog();
+    });
+    row.appendChild(label); row.appendChild(x);
+    shareList.appendChild(row);
+  });
+}
+function openShareDialog() {
+  const b = activeBoard();
+  if (!b || b.virtual || !isOwner(b)) return;
+  shareEmail.value = "";
+  renderShareDialog();
+  shareBackdrop.hidden = false; shareDialog.hidden = false;
+}
+function closeShareDialog() { shareBackdrop.hidden = true; shareDialog.hidden = true; }
+shareBoardBtn.addEventListener("click", openShareDialog);
+document.getElementById("share-close").addEventListener("click", closeShareDialog);
+shareBackdrop.addEventListener("click", closeShareDialog);
+document.getElementById("share-add-btn").addEventListener("click", async () => {
+  const b = activeBoard();
+  const email = shareEmail.value.trim();
+  if (!b || !email) return;
+  const { data: uid, error } = await sb.rpc("lookup_user_by_email", { p_email: email });
+  if (error) { alert("Errore nella ricerca: " + error.message + "\n(Hai eseguito lo schema SQL aggiornato?)"); return; }
+  if (!uid) { alert("Nessun utente workFlow con questa email. Deve prima avere un account."); return; }
+  if (uid === myUserId) { alert("Questa è la tua email."); return; }
+  if (boardMembers.some((m) => m.board_id === b.id && m.user_id === uid)) { alert("Già condivisa con questa persona."); return; }
+  const { data: row, error: insErr } = await sb.from("board_members").insert({ board_id: b.id, user_id: uid, email }).select().single();
+  if (insErr) { alert("Errore nella condivisione: " + insErr.message); return; }
+  boardMembers.push(row);
+  await saveBoardMerged(b); // pubblica categorie e persone per chi viene invitato
+  pushNotification(uid, myName() + " ha condiviso con te la bacheca «" + (b.name || "") + "»", null, "board_shared", b.id);
+  shareEmail.value = "";
+  renderShareDialog();
+});
+async function onMembersChange(payload) {
+  if (payload.eventType === "DELETE") {
+    const o = payload.old;
+    boardMembers = boardMembers.filter((m) => !(m.board_id === o.board_id && m.user_id === o.user_id));
+    if (o.user_id === myUserId) {
+      boards = boards.filter((b) => b.id !== o.board_id);
+      if (view === "board" && activeBoardId === o.board_id) goHome();
+    }
+  } else {
+    const m = payload.new;
+    if (!boardMembers.some((x) => x.board_id === m.board_id && x.user_id === m.user_id)) boardMembers.push(m);
+    if (m.user_id === myUserId && !boards.some((b) => b.id === m.board_id)) {
+      const { data } = await sb.from("boards").select("*").eq("id", m.board_id).single();
+      if (data) { boards.push(data); setBase(data); }
+    }
+  }
+  if (view === "home") renderHome();
+}
+window.addEventListener("focus", refreshShares);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshShares(); });
  
 /* ---------- NOTIFICHE (zona chat) ---------- */
 let notifications = [];
@@ -916,6 +1134,10 @@ function openNotification(n) {
   markNotifRead(n);
   chatPopover.hidden = true;
   closeArchivePanel();
+  if (n.board_id && !n.task_id) {
+    if (boards.some((b) => b.id === n.board_id)) openBoard(n.board_id); else goHome();
+    return;
+  }
   if (!n.task_id) return;
   const mine = findTaskAnyBoard(n.task_id);
   if (mine) { openBoard(mine.board.id); openTaskModal(n.task_id); return; }
@@ -935,9 +1157,9 @@ async function loadNotifications() {
   else notifications = data || [];
   renderNotifications();
 }
-async function pushNotification(recipientId, text, taskId, kind) {
+async function pushNotification(recipientId, text, taskId, kind, boardId) {
   if (!recipientId || recipientId === myUserId) return;
-  const { error } = await sb.from("notifications").insert({ user_id: recipientId, from_name: myName(), text, task_id: taskId, kind });
+  const { error } = await sb.from("notifications").insert({ user_id: recipientId, from_name: myName(), text, task_id: taskId, kind, board_id: boardId || null });
   if (error) console.error("Invio notifica:", error.message);
 }
 function onNotificationChange(payload) {
@@ -1003,7 +1225,7 @@ async function applySharedRowToOwner(row) {
   if (JSON.stringify(pickShared(found.task)) === s) return false;
   Object.assign(found.task, row.data);
   if (found.task.status === "done") removeFromDigestIfPresent(found.task.id);
-  await sb.from("boards").update({ data: found.board.data, updated_at: new Date().toISOString() }).eq("id", found.board.id);
+  await persistBoardData(found.board);
   return true;
 }
 async function syncSharedTasks(boardList) {
@@ -1011,7 +1233,8 @@ async function syncSharedTasks(boardList) {
   try {
     for (const b of boardList) {
       for (const t of (b.data.tasks || [])) {
-        const desired = linkedAssignees(t);
+        if (!isOwner(b)) continue;
+        const desired = linkedAssignees(t).filter((uid) => !isParticipant(b, uid));
         const payload = pickShared(t);
         const sd = JSON.stringify(payload);
         for (const aid of desired) {
@@ -1134,6 +1357,13 @@ function candidatePool(excludeIds) {
     (b.data.tasks || []).forEach((t) => {
       if ((t.status || "todo") === "done") return;
       if (excludeIds.includes(t.id)) return;
+      if (isBoardShared(b)) {
+        const ppl = peopleFor(b);
+        const linked = (t.memberIds || []).map((id) => ppl.find((x) => x.id === id)).filter((x) => x && x.linked_user_id).map((x) => x.linked_user_id);
+        const mine = linked.includes(myUserId);
+        const others = linked.some((u) => u !== myUserId);
+        if (!isOwner(b) ? !mine : (others && !mine)) return;
+      }
       pool.push({ board: b, task: t, score: scoreTask(t) });
     });
   });
@@ -1150,7 +1380,7 @@ let digestBusy = false;
 async function persistBoards(boardIds) {
   await Promise.all(Array.from(new Set(boardIds)).map((boardId) => {
     const b = boards.find((x) => x.id === boardId);
-    return sb.from("boards").update({ data: b.data, updated_at: new Date().toISOString() }).eq("id", b.id);
+    return persistBoardData(b);
   }));
 }
 // Riempie "le mie attivita'" fino al numero obiettivo, scegliendo solo task ancora da fare.
@@ -1252,7 +1482,7 @@ function renderMyTasksPanel() {
     const found = findTaskAnyBoard(id);
     if (!found) return;
     const { board, task } = found;
-    const category = categories.find((c) => c.id === task.categoryId);
+    const category = catsFor(board).find((c) => c.id === task.categoryId);
     const row = document.createElement("div");
     row.className = "mytasks-item";
     row.style.background = category ? category.color : "#fff5a8";
@@ -1329,6 +1559,12 @@ function buildFolderTile(b) {
   tile.className = "folder-tile";
   tile.innerHTML = '<span class="folder-icon"></span><span class="folder-label"></span>';
   tile.querySelector(".folder-label").textContent = b.name || "(senza nome)";
+  if (isBoardShared(b)) {
+    const tag = document.createElement("span");
+    tag.className = "folder-shared-tag";
+    tag.textContent = isOwner(b) ? "condivisa" : "condivisa con te";
+    tile.querySelector(".folder-label").appendChild(tag);
+  }
   const pct = boardProgressPct(b);
   if (pct !== null) tile.querySelector(".folder-icon").appendChild(buildProgressBadge(pct));
   tile.addEventListener("click", () => { closeArchivePanel(); openBoard(b.id); });
@@ -1337,15 +1573,10 @@ function buildFolderTile(b) {
   del.className = "folder-delete";
   del.innerHTML = "&times;";
   del.title = "Elimina bacheca";
+  del.title = isOwner(b) ? "Elimina bacheca" : "Esci dalla bacheca";
   del.addEventListener("click", async (e) => {
     e.stopPropagation();
-    if (boards.length === 1) { alert("Non puoi eliminare l'unica bacheca rimasta."); return; }
-    if (!confirm('Eliminare la bacheca "' + (b.name || "") + '" e tutti i suoi lavori?')) return;
-    const { error } = await sb.from("boards").delete().eq("id", b.id);
-    if (error) { alert("Errore nell'eliminazione: " + error.message); return; }
-    boards = boards.filter((x) => x.id !== b.id);
-    renderHome();
-    renderArchivePanel();
+    if (await leaveOrDeleteBoard(b)) { renderHome(); renderArchivePanel(); }
   });
   tile.appendChild(del);
   return tile;
@@ -1435,13 +1666,8 @@ boardDeadlineInput.addEventListener("change", () => {
 });
 deleteBoardBtn.addEventListener("click", async () => {
   const board = activeBoard();
-  if (!board) return;
-  if (boards.length === 1) { alert("Non puoi eliminare l'unica bacheca rimasta."); return; }
-  if (!confirm('Eliminare la bacheca "' + (board.name || "") + '" e tutti i suoi lavori?')) return;
-  const { error } = await sb.from("boards").delete().eq("id", board.id);
-  if (error) { alert("Errore nell'eliminazione: " + error.message); return; }
-  boards = boards.filter((b) => b.id !== board.id);
-  goHome();
+  if (!board || board.virtual) return;
+  if (await leaveOrDeleteBoard(board)) goHome();
 });
  
 function renderBoardView() {
@@ -1450,9 +1676,12 @@ function renderBoardView() {
   contextTitle.textContent = board.name || "Bacheca";
   boardNameInput.value = board.name || "";
   boardDeadlineInput.value = board.data.deadline || "";
-  boardNameInput.disabled = !!board.virtual;
-  boardDeadlineInput.disabled = !!board.virtual;
+  const canAdmin = !board.virtual && isOwner(board);
+  boardNameInput.disabled = !canAdmin;
+  boardDeadlineInput.disabled = !canAdmin;
+  shareBoardBtn.hidden = !canAdmin;
   deleteBoardBtn.hidden = !!board.virtual;
+  deleteBoardBtn.textContent = canAdmin ? "Elimina bacheca" : "Esci dalla bacheca";
   boardColumnsEl.innerHTML = "";
   if (!board.data.tasks) board.data.tasks = [];
   COLUMNS.forEach((col) => boardColumnsEl.appendChild(renderColumn(board, col)));
@@ -1468,7 +1697,7 @@ function renderColumn(board, col) {
   node.querySelector(".add-card-btn").addEventListener("click", () => {
     const task = {
       id: uid_(), title: "", desc: "", status: col.id,
-      categoryId: categories[0] ? categories[0].id : null,
+      categoryId: catsFor(board)[0] ? catsFor(board)[0].id : null,
       urgency: "media", memberIds: [], subtasks: [], deadline: null,
       order: Date.now(), createdAt: Date.now(),
     };
@@ -1505,7 +1734,7 @@ function renderCard(board, task) {
   node.className = "card";
   node.draggable = true;
   node.dataset.taskId = task.id;
-  const category = categories.find((c) => c.id === task.categoryId);
+  const category = catsFor(board).find((c) => c.id === task.categoryId);
   node.style.background = (task.status === "done") ? "#AACF38" : (category ? category.color : "#f0f0f0");
  
   node.addEventListener("dragstart", (e) => {
@@ -1539,7 +1768,7 @@ function renderCard(board, task) {
   const avatarRow = document.createElement("div");
   avatarRow.className = "avatar-row";
   (task.memberIds || []).forEach((pid) => {
-    const person = people.find((p) => p.id === pid);
+    const person = peopleFor(board).find((p) => p.id === pid);
     if (!person) return;
     const av = document.createElement("span");
     av.className = "avatar";
@@ -1581,7 +1810,7 @@ function openTaskModal(taskId) {
   modalCreatedLabel.textContent = "Creato: " + d.toLocaleDateString("it-IT");
  
   modalCategory.innerHTML = "";
-  categories.forEach((c) => {
+  catsFor(activeBoard()).forEach((c) => {
     const opt = document.createElement("option");
     opt.value = c.id; opt.textContent = c.name;
     if (c.id === task.categoryId) opt.selected = true;
@@ -1660,7 +1889,7 @@ function renderModalMembers(task) {
     return;
   }
   (task.memberIds || []).forEach((pid) => {
-    const person = people.find((p) => p.id === pid);
+    const person = peopleFor(activeBoard()).find((p) => p.id === pid);
     if (!person) return;
     const chip = document.createElement("span");
     chip.className = "member-chip";
@@ -1686,10 +1915,11 @@ function renderModalMembers(task) {
     if (existing) { existing.remove(); return; }
     const picker = document.createElement("div");
     picker.className = "member-picker";
-    if (people.length === 0) {
+    const plist = peopleFor(activeBoard());
+    if (plist.length === 0) {
       picker.innerHTML = '<div class="member-picker-row">Nessuna persona creata</div>';
     }
-    people.forEach((p) => {
+    plist.forEach((p) => {
       const row = document.createElement("div");
       row.className = "member-picker-row" + ((task.memberIds || []).includes(p.id) ? " selected" : "");
       row.innerHTML = '<span class="member-picker-check"></span><span class="avatar"></span><span></span>';
